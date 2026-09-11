@@ -197,14 +197,69 @@ def release_resources() -> None:
         torch.cuda.empty_cache()
 
 
+STARTUP_ERROR: str = ''
+
+# Standard install locations for ffmpeg. Needed because an app launched from the
+# Dock inherits launchd's minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin), which does
+# NOT contain /opt/homebrew/bin.
+_FFMPEG_FALLBACK_DIRS = ('/opt/homebrew/bin', '/usr/local/bin', '/opt/local/bin')
+
+
+def _find_ffmpeg() -> str | None:
+    """Locate ffmpeg, falling back to the usual Homebrew/MacPorts directories.
+
+    A Dock launch gets a minimal PATH from launchd, so a bare
+    shutil.which('ffmpeg') reports "not installed" even though ffmpeg is
+    present -- the app then returned early and vanished with no window. Probing
+    the standard dirs (and prepending the hit to PATH so child processes inherit
+    it) makes Dock launches work.
+    """
+    found = shutil.which('ffmpeg')
+    if found:
+        return found
+    for directory in _FFMPEG_FALLBACK_DIRS:
+        candidate = os.path.join(directory, 'ffmpeg')
+        if os.access(candidate, os.X_OK):
+            os.environ['PATH'] = directory + os.pathsep + os.environ.get('PATH', '')
+            return candidate
+    return None
+
+
 def pre_check() -> bool:
+    global STARTUP_ERROR
     if sys.version_info < (3, 9):
-        update_status('Python version is not supported - please upgrade to 3.9 or higher.')
+        STARTUP_ERROR = 'Python version is not supported - please upgrade to 3.9 or higher.'
+        update_status(STARTUP_ERROR)
         return False
-    if not shutil.which('ffmpeg'):
+    if _find_ffmpeg() is None:
+        STARTUP_ERROR = (
+            'ffmpeg was not found.\n\n'
+            'Deep-Live-Cam needs ffmpeg on PATH. Install it with:\n'
+            '    brew install ffmpeg\n'
+            'or add its folder (for example /opt/homebrew/bin) to PATH.'
+        )
         update_status('ffmpeg is not installed.')
         return False
     return True
+
+
+def _report_startup_failure() -> None:
+    """Surface a startup failure instead of exiting silently.
+
+    Launched from the Dock there is no terminal, so a bare `return` here made the
+    app disappear with no window and no trace whatsoever -- indistinguishable
+    from "the app refuses to open".
+    """
+    message = STARTUP_ERROR or 'Deep-Live-Cam could not start.'
+    print(f'[DLC.CORE] startup failed: {message}', flush=True)
+    if modules.globals.headless:
+        return
+    try:
+        from PySide6.QtWidgets import QApplication, QMessageBox
+        app = QApplication.instance() or QApplication(sys.argv)
+        QMessageBox.critical(None, 'Deep-Live-Cam - unable to start', message)
+    except Exception as exc:
+        print(f'[DLC.CORE] could not show the error dialog: {exc!r}', flush=True)
 
 
 def update_status(message: str, scope: str = 'DLC.CORE') -> None:
@@ -340,9 +395,11 @@ def destroy(to_quit=True) -> None:
 def run() -> None:
     parse_args()
     if not pre_check():
+        _report_startup_failure()
         return
     for frame_processor in get_frame_processors_modules(modules.globals.frame_processors):
         if not frame_processor.pre_check():
+            _report_startup_failure()
             return
     # Pre-load face analyser in main thread before GUI starts
     #from modules.face_analyser import get_face_analyser

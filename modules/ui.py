@@ -60,6 +60,7 @@ from modules.face_analyser import (
     detect_one_face_fast,
     ensure_landmarks,
     get_one_face,
+    get_one_face_robust,
     get_unique_faces_from_target_image,
     get_unique_faces_from_target_video,
     has_valid_map,
@@ -423,6 +424,40 @@ def get_available_cameras() -> Tuple[List[int], List[str]]:
             return [], ["No cameras found"]
 
     if platform.system() == "Darwin":
+        # macOS: enumerate the real AVFoundation devices.
+        #
+        # Do NOT fall back to a hardcoded [0, 1]: plain VideoCapture(i)
+        # indices are not the same as the enumerator's indices, and the
+        # working camera can live well outside 0..1 (FaceTime HD reports
+        # as 1202 here).  With [0, 1] the list pointed at a Continuity iPhone
+        # (black until the phone streams) and a virtual ManyCam device
+        # (placeholder card), so the live preview was blank even though the
+        # built-in camera was working fine.
+        try:
+            from cv2_enumerate_cameras import enumerate_cameras
+
+            cameras = list(enumerate_cameras())
+            if cameras:
+                # Put the built-in camera first.  Continuity / virtual devices
+                # (iPhone, ManyCam, OBS...) enumerate ahead of it, and the
+                # dropdown defaults to the first entry — which left the live
+                # preview showing a black iPhone feed or a "start ManyCam"
+                # placeholder card instead of the working camera.
+                def _rank(camera):
+                    name = camera.name.lower()
+                    if "facetime" in name:
+                        return (0, name)
+                    if "built-in" in name or "internal" in name:
+                        return (1, name)
+                    return (2, name)
+
+                cameras.sort(key=_rank)
+                return (
+                    [camera.index for camera in cameras],
+                    [camera.name for camera in cameras],
+                )
+        except Exception as exc:
+            print(f"Error detecting cameras: {exc}")
         return [0, 1], ["Camera 0", "Camera 1"]
 
     # Linux probe
@@ -947,6 +982,10 @@ class MainWindow(QMainWindow):
             _open_live_mapper_dialog(camera_index, modules.globals.source_target_map)
 
     def closeEvent(self, event):
+        # Tear the camera/worker threads down BEFORE quitting. A live QThread
+        # destroyed during interpreter shutdown makes Qt qFatal -> abort(), which
+        # is what produced the "Deep-Live-Cam quit unexpectedly" dialog.
+        shutdown_live_preview()
         # Treat OS-level close as Destroy click
         self._destroy_cb()
         event.accept()
@@ -1001,7 +1040,7 @@ class PreviewWindow(QWidget):
         from modules.processors.frame.core import get_frame_processors_modules as _gfpm
         for fp in _gfpm(modules.globals.frame_processors):
             temp_frame = fp.process_frame(
-                get_one_face(imread_unicode(modules.globals.source_path)), temp_frame
+                get_one_face_robust(imread_unicode(modules.globals.source_path)), temp_frame
             )
         # Fit to current widget size while preserving aspect ratio.
         h, w = temp_frame.shape[:2]
@@ -1015,6 +1054,78 @@ class PreviewWindow(QWidget):
 
 
 # ─── webcam preview window ───────────────────────────────────────────────
+
+
+# ─── virtual camera output (pyvirtualcam) ───────────────────────────────
+# Feeds the processed live-preview frames straight into the system virtual
+# camera, so calls can use the swapped feed WITHOUT any screen capture.
+# On macOS pyvirtualcam drives OBS's built-in virtual camera (OBS 30+), and OBS
+# must not be outputting its own virtual camera at the same time.
+_VCAM_LOCK = threading.Lock()
+_VCAM = None                      # pyvirtualcam.Camera instance
+_VCAM_SIZE: Tuple[int, int] = (0, 0)
+_VCAM_DISABLED = False            # set after a failure so we don't retry per frame
+
+
+def send_to_virtual_camera(frame: np.ndarray) -> None:
+    """Send one processed BGR frame to the virtual camera (no-op if disabled)."""
+    global _VCAM, _VCAM_SIZE, _VCAM_DISABLED
+    if _VCAM_DISABLED or not getattr(modules.globals, "virtual_camera", True):
+        return
+    h, w = frame.shape[:2]
+    with _VCAM_LOCK:
+        try:
+            if _VCAM is None or _VCAM_SIZE != (w, h):
+                if _VCAM is not None:
+                    try:
+                        _VCAM.close()
+                    except Exception:
+                        pass
+                    _VCAM = None
+                import pyvirtualcam
+                from pyvirtualcam import PixelFormat
+
+                _VCAM = pyvirtualcam.Camera(width=w, height=h, fps=30,
+                                            fmt=PixelFormat.BGR, print_fps=False)
+                _VCAM_SIZE = (w, h)
+                print(f"[vcam] virtual camera opened: {_VCAM.device} ({w}x{h})")
+            _VCAM.send(np.ascontiguousarray(frame))
+        except Exception as exc:
+            _VCAM_DISABLED = True
+            print(f"[vcam] disabled after error: {exc!r}")
+
+
+def close_virtual_camera() -> None:
+    """Release the pyvirtualcam device so a later run can re-open it."""
+    global _VCAM, _VCAM_SIZE
+    with _VCAM_LOCK:
+        if _VCAM is not None:
+            try:
+                _VCAM.close()
+            except Exception:
+                pass
+            _VCAM = None
+        _VCAM_SIZE = (0, 0)
+
+
+def shutdown_live_preview() -> None:
+    """Stop the live-preview worker threads and release the virtual camera.
+
+    Must run BEFORE the process exits. While live preview is up, _CaptureWorker
+    and _ProcessingWorker are live QThreads; if they are still running when the
+    interpreter finalizes, Qt calls qFatal -> abort() ("QThread: Destroyed while
+    thread is still running") and macOS reports "Deep-Live-Cam quit unexpectedly"
+    with a SIGABRT crash report. Closing the preview stops the timer, sets the
+    stop event and joins both workers, so the shutdown is clean.
+    """
+    global _WEBCAM_PREVIEW
+    preview, _WEBCAM_PREVIEW = _WEBCAM_PREVIEW, None
+    if preview is not None:
+        try:
+            preview.close()  # closeEvent: stops timer, sets stop_event, joins workers
+        except Exception as exc:
+            print(f'[webcam] shutdown error: {exc!r}')
+    close_virtual_camera()
 
 
 class _CaptureWorker(QThread):
@@ -1084,7 +1195,7 @@ class _ProcessingWorker(QThread):
                     and modules.globals.source_path != last_source_path
                 ):
                     last_source_path = modules.globals.source_path
-                    source_image = get_one_face(imread_unicode(modules.globals.source_path))
+                    source_image = get_one_face_robust(imread_unicode(modules.globals.source_path))
 
                 det_count += 1
                 if det_count % det_interval == 0:
@@ -1163,6 +1274,10 @@ class _ProcessingWorker(QThread):
                 fps = frame_count / (current_time - prev_time)
                 frame_count = 0
                 prev_time = current_time
+
+            # feed the virtual camera BEFORE the on-screen FPS overlay is drawn,
+            # so the outgoing call feed stays clean
+            send_to_virtual_camera(temp_frame)
 
             if modules.globals.show_fps:
                 cv2.putText(

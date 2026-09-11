@@ -9,7 +9,7 @@ import modules.globals
 import modules.processors.frame.core
 from modules import imread_unicode, imwrite_unicode
 from modules.core import update_status
-from modules.face_analyser import get_one_face, get_many_faces, default_source_face
+from modules.face_analyser import get_one_face, get_one_face_robust, get_many_faces, default_source_face
 from modules.typing import Face, Frame
 from modules.utilities import (
     is_image,
@@ -934,7 +934,7 @@ def process_frames(
                     # Specific error for file reading failure
                     update_status(f"Error reading source image file {source_path}. Please check the path and file integrity.", NAME)
                 else:
-                    source_face = get_one_face(source_img)
+                    source_face = get_one_face_robust(source_img)
                     if source_face is None:
                         # Specific message for no face detected after successful read
                         update_status(f"Warning: Successfully read source image {source_path}, but no face was detected. Swaps will be skipped.", NAME)
@@ -1060,7 +1060,7 @@ def process_image(source_path: str, target_path: str, output_path: str) -> None:
                 if source_img is None:
                     update_status(f"Error: Could not read source image: {source_path}", NAME)
                     return
-                source_face = get_one_face(source_img)
+                source_face = get_one_face_robust(source_img)
                 if not source_face:
                     update_status(f"Error: No face found in source image: {source_path}", NAME)
                     return
