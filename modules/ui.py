@@ -1063,49 +1063,88 @@ class PreviewWindow(QWidget):
 # must not be outputting its own virtual camera at the same time.
 _VCAM_LOCK = threading.Lock()
 _VCAM = None                      # pyvirtualcam.Camera instance
-_VCAM_SIZE: Tuple[int, int] = (0, 0)
-_VCAM_DISABLED = False            # set after a failure so we don't retry per frame
+_VCAM_SIZE: Tuple[int, int] = (0, 0)   # LATCHED output size (see send_to_virtual_camera)
+_VCAM_RETRY_AT = 0.0              # backoff timestamp after a failed send
+_VCAM_SWAPPING_PREVIEW = False    # True while one preview window replaces another
+
+# Fixed output mode for the virtual camera. Call apps negotiate against the
+# formats the OBS camera extension advertises, so a 640x480 producer leaves
+# them with no matching format to attach to -- which shows up as a blank
+# camera in the call.
+#
+# The macOS OBS camera extension publishes exactly ONE mode at a time, and
+# with a pyvirtualcam producer it is 1920x1080@60 -- so that is what the
+# producer must declare, and what consumers (browsers/Telegram) attach to.
+# Verified working: Telegram receives this mode.
+#
+# (BlueStacks' Android camera layer hardcodes a 1280x720@30 request which no
+# virtual camera on this Mac advertises; that mismatch is handled on
+# BlueStacks' side by the ffmpeg shim described in DOCUMENTATION.md, which
+# captures at this native 1080p60 mode and scales down to 720p30.)
+VCAM_OUT_W = 1920
+VCAM_OUT_H = 1080
+VCAM_OUT_FPS = 60
 
 
 def send_to_virtual_camera(frame: np.ndarray) -> None:
-    """Send one processed BGR frame to the virtual camera (no-op if disabled)."""
-    global _VCAM, _VCAM_SIZE, _VCAM_DISABLED
-    if _VCAM_DISABLED or not getattr(modules.globals, "virtual_camera", True):
+    """Send one processed BGR frame to the system virtual camera.
+
+    The output size is LATCHED to the first frame and never changed afterwards:
+    closing/reopening pyvirtualcam tears the OBS Virtual Camera device down and
+    back up, and any app already attached to it gets orphaned -- which shows up
+    as a permanently blank camera in an ongoing call. Frames that arrive at a
+    different size are resized to the latched size instead.
+
+    A failed send never disables the camera permanently: the broken handle is
+    dropped and retried after a short cooldown, since a single transient error
+    would otherwise blank the camera for the rest of the session.
+    """
+    global _VCAM, _VCAM_SIZE, _VCAM_RETRY_AT
+    if not getattr(modules.globals, "virtual_camera", True):
         return
-    h, w = frame.shape[:2]
+    if _VCAM is None and time.time() < _VCAM_RETRY_AT:
+        return
     with _VCAM_LOCK:
         try:
-            if _VCAM is None or _VCAM_SIZE != (w, h):
-                if _VCAM is not None:
-                    try:
-                        _VCAM.close()
-                    except Exception:
-                        pass
-                    _VCAM = None
+            if _VCAM is None:
                 import pyvirtualcam
                 from pyvirtualcam import PixelFormat
 
-                _VCAM = pyvirtualcam.Camera(width=w, height=h, fps=30,
+                _VCAM = pyvirtualcam.Camera(width=VCAM_OUT_W, height=VCAM_OUT_H,
+                                            fps=VCAM_OUT_FPS,
                                             fmt=PixelFormat.BGR, print_fps=False)
-                _VCAM_SIZE = (w, h)
-                print(f"[vcam] virtual camera opened: {_VCAM.device} ({w}x{h})")
+                _VCAM_SIZE = (VCAM_OUT_W, VCAM_OUT_H)
+                print(f"[vcam] virtual camera opened: {_VCAM.device} "
+                      f"({VCAM_OUT_W}x{VCAM_OUT_H}@{VCAM_OUT_FPS})", flush=True)
+            if frame.shape[1] != _VCAM_SIZE[0] or frame.shape[0] != _VCAM_SIZE[1]:
+                frame = cv2.resize(frame, _VCAM_SIZE,
+                                   interpolation=cv2.INTER_LANCZOS4)
             _VCAM.send(np.ascontiguousarray(frame))
         except Exception as exc:
-            _VCAM_DISABLED = True
-            print(f"[vcam] disabled after error: {exc!r}")
+            print(f"[vcam] send failed ({exc!r}) - retrying in 2s", flush=True)
+            try:
+                if _VCAM is not None:
+                    _VCAM.close()
+            except Exception:
+                pass
+            _VCAM = None
+            _VCAM_SIZE = (0, 0)
+            _VCAM_RETRY_AT = time.time() + 2.0
 
 
 def close_virtual_camera() -> None:
-    """Release the pyvirtualcam device so a later run can re-open it."""
-    global _VCAM, _VCAM_SIZE
+    """Release the pyvirtualcam device (app quit, or a genuine stop of live view)."""
+    global _VCAM, _VCAM_SIZE, _VCAM_RETRY_AT
     with _VCAM_LOCK:
         if _VCAM is not None:
             try:
                 _VCAM.close()
-            except Exception:
-                pass
+                print("[vcam] virtual camera released", flush=True)
+            except Exception as exc:
+                print(f"[vcam] error releasing virtual camera: {exc!r}", flush=True)
             _VCAM = None
         _VCAM_SIZE = (0, 0)
+        _VCAM_RETRY_AT = 0.0
 
 
 def shutdown_live_preview() -> None:
@@ -1367,6 +1406,12 @@ class WebcamPreviewWindow(QWidget):
             self._cap.release()
         except Exception:
             pass
+        # Release the virtual camera only on a GENUINE stop. While a preview is
+        # merely being replaced (Live pressed again, mapper submitted) the device
+        # must stay up, or an app already attached to it is orphaned and the call
+        # goes blank for good.
+        if not _VCAM_SWAPPING_PREVIEW:
+            close_virtual_camera()
         global _WEBCAM_PREVIEW
         if _WEBCAM_PREVIEW is self:
             _WEBCAM_PREVIEW = None
@@ -1374,9 +1419,20 @@ class WebcamPreviewWindow(QWidget):
 
 
 def _open_webcam_preview(camera_index: int) -> None:
-    global _WEBCAM_PREVIEW
-    if _WEBCAM_PREVIEW is not None:
-        _WEBCAM_PREVIEW.close()
+    """Open the live preview, replacing any preview that is already open.
+
+    Replacing the window must NOT release the virtual camera. Closing it used to
+    tear the device down and immediately bring it back up, which orphans any app
+    already attached to it -- pressing Live again (or submitting the mapper)
+    during a call left the caller with a permanently blank camera.
+    """
+    global _WEBCAM_PREVIEW, _VCAM_SWAPPING_PREVIEW
+    _VCAM_SWAPPING_PREVIEW = True
+    try:
+        if _WEBCAM_PREVIEW is not None:
+            _WEBCAM_PREVIEW.close()
+    finally:
+        _VCAM_SWAPPING_PREVIEW = False
     _WEBCAM_PREVIEW = WebcamPreviewWindow(camera_index)
     _WEBCAM_PREVIEW.show()
 
